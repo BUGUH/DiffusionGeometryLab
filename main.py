@@ -1,165 +1,298 @@
-# main.py
-import torch
-import os
-import sys
-import argparse
+# DiffusionGeometryLab
 
-# 获取当前 main.py 所在的目录，并添加到 sys.path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.append(current_dir)
+**扩散模型几何相变实验框架** — 研究不同环境维度 $d$ 下，Diffusion Model 在反向去噪过程中从"泛化"到"记忆"相变的几何性质。
 
-from src.utils import load_config, set_seed, setup_logger, get_experiment_dir
-from src.data.celeba_loader import get_dataloader, CelebAParquetDataset
-from src.diffusion.schedulers import get_scheduler
-from src.models.unet import SimpleUNet
-from src.engine.trainer import DiffusionTrainer
-from src.metrics.cosine_field import CosineFieldEvaluator
-from src.metrics.memory_stats import MemoryRatioTracker
-from src.visualization.plotter import GeometryPlotter
+## 研究目标
 
-def run_training_phase(cfg, device, logger, exp_dir):
-    """阶段一：训练与状态捕获"""
-    logger.info("Phase 1: Training & State Capturing...")
-    
-    # 1. 数据加载
-    train_loader = get_dataloader(
-        parquet_path=cfg.data.source_path,
-        target_dim=cfg.data.target_dim,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        shuffle=True
-    )
-    
-    # 构建验证集加载器 (不shuffle)
-    test_loader = get_dataloader(
-        parquet_path=cfg.data.source_path, # 实际应切分数据集，此处演示复用
-        target_dim=cfg.data.target_dim,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        shuffle=False
-    )
-    
-    # 2. 调度器
-    scheduler = get_scheduler(cfg)
-    
-    # 3. 训练器
-    trainer = DiffusionTrainer(cfg, train_loader, test_loader, scheduler, device, exp_dir)
-    trainer.run()
-    
-    return trainer.model, scheduler
+固定数据的**有效流形维度** $m$（如 $32 \times 32$ 灰度图，$m=1024$），通过零填充将数据嵌入到更高维度的环境空间 $d$（如 $64 \times 64$, $128 \times 128$），观察 $d/m$ 比率如何影响扩散模型的：
 
-def run_analysis_phase(cfg, device, logger, exp_dir, scheduler):
-    """阶段二：几何指标分析"""
-    logger.info("Phase 2: Geometry Analysis...")
-    
-    gen_path = os.path.join(exp_dir, "model_gen.pt")
-    mem_path = os.path.join(exp_dir, "model_mem.pt")
-    
-    # 检查 Checkpoint 是否存在
-    if not os.path.exists(gen_path) or not os.path.exists(mem_path):
-        logger.error("Checkpoints not found. Skipping analysis.")
-        return
+- **泛化状态** $M_{gen}$：模型学会了流形结构，能生成新颖样本
+- **记忆状态** $M_{mem}$：模型背诵了训练集，发生模式坍塌
+- **相变几何**：通过余弦相似度场、记忆比例等指标刻画相变的发生时机和几何性质
 
-    # 1. 加载模型
-    model_gen = SimpleUNet().to(device)
-    model_mem = SimpleUNet().to(device)
-    
-    ckpt_gen = torch.load(gen_path, map_location=device)
-    model_gen.load_state_dict(ckpt_gen['model_state_dict'])
-    model_gen.eval()
-    
-    ckpt_mem = torch.load(mem_path, map_location=device)
-    model_mem.load_state_dict(ckpt_mem['model_state_dict'])
-    model_mem.eval()
-    
-    # 2. 准备评估工具
-    field_evaluator = CosineFieldEvaluator(scheduler, device)
-    
-    # 准备 Faiss 数据 (为了速度，仅取训练集前 1000 张)
-    # 生产环境需加载全量数据
-    dataset = CelebAParquetDataset(cfg.data.source_path, cfg.data.target_dim)
-    subset = torch.utils.data.Subset(dataset, range(min(1000, len(dataset))))
-    subset_loader = torch.utils.data.DataLoader(subset, batch_size=100, shuffle=False)
-    
-    # 构建 Faiss 索引数据 [N, D]
-    train_vectors = []
-    for batch in subset_loader:
-        train_vectors.append(batch.view(batch.shape[0], -1))
-    train_vectors = torch.cat(train_vectors, dim=0).cpu().numpy()
-    
-    mem_tracker = MemoryRatioTracker(train_vectors, str(device), d_dim=cfg.data.target_dim)
-    
-    # 3. 循环计算时间步指标
-    timesteps = range(0, cfg.diffusion.num_timesteps, 50) # 每隔 50 步采样
-    results = {'S_cos_gen_mem': [], 'S_cos_emp_gen': [], 'S_cos_emp_mem': [], 'f_mem': []}
-    
-    # 获取一批测试数据
-    data_iter = iter(subset_loader)
-    x_0_batch = next(data_iter).to(device)
-    
-    logger.info("Analyzing timesteps...")
-    with torch.no_grad():
-        for t in timesteps:
-            t_tensor = torch.full((x_0_batch.shape[0],), t, device=device, dtype=torch.long)
-            noise = torch.randn_like(x_0_batch)
-            
-            # 加噪
-            x_t = scheduler.add_noise(x_0_batch, noise, t_tensor)
-            
-            # 指标计算
-            # 1. Gen vs Mem
-            s1 = field_evaluator.compute_model_alignment(model_gen, model_mem, x_t, t_tensor)
-            
-            # 2. Empirical Alignment
-            s2 = field_evaluator.compute_empirical_alignment(model_gen, x_t, x_0_batch, t_tensor)
-            s3 = field_evaluator.compute_empirical_alignment(model_mem, x_t, x_0_batch, t_tensor)
-            
-            # 3. Memory Ratio
-            f_mem, _ = mem_tracker.compute_dynamic_memory_ratio(x_t)
-            
-            results['S_cos_gen_mem'].append(s1)
-            results['S_cos_emp_gen'].append(s2)
-            results['S_cos_emp_mem'].append(s3)
-            results['f_mem'].append(f_mem)
-            
-            logger.info(f"Step {t}: S_cos(gen,mem)={s1:.3f}, f_mem={f_mem:.3f}")
+## 项目结构
 
-    # 4. 可视化
-    plotter = GeometryPlotter(exp_dir)
-    plotter.plot_similarity_fields(list(timesteps), results, cfg.name)
-    plotter.plot_memory_ratio(list(timesteps), results['f_mem'], cfg.name)
+```
+DiffusionGeometryLab/
+│
+├── main.py                           # 顶层入口
+├── setup.py                          # 安装配置
+├── README.md                         # 本文件
+│
+├── configs/                          # 配置文件
+│   ├── circle.yaml                   # 圆环测试配置
+│   ├── default.yaml                  # 全局默认配置（CelebA）
+│   ├── toy_test.yaml                 # 合成数据快速测试配置
+│   ├── data/
+│   │   ├── celeba_4096.yaml          # d=4096 覆盖
+│   │   └── celeba_16384.yaml         # d=16384 覆盖
+│   └── scheduler/
+│       ├── of.yaml                   # OF 调度参数
+│       ├── ve.yaml                   # VE 调度参数
+│       └── vp.yaml                   # VP 调度参数
+│
+├── diffusion/                        # 数据存储等
+│   └── CelebA/
+│
+├── outputs/                          # 输出结果目录
+│
+├── scripts/                          # 运行脚本
+│   ├── demo_circle.py                # 2D 圆环可视化 demo
+│   ├── evaluate.py                   # 全指标评估入口
+│   ├── run_circle_experiments.py     # 圆环相关实验入口
+│   ├── sweep_dimensions.py           # 多维度批量实验
+│   ├── toy_full_pipeline.py          # ★ 合成数据端到端测试
+│   ├── train.py                      # 正式训练入口
+│   ├── verify_pipeline.py            # 管线单元验证
+│   └── visualize_trajectories.py     # 轨迹可视化
+│
+└── src/                              # 核心源码
+    ├── data/                         # 数据管线
+    │   ├── dataset.py                #   Dataset/DataLoader
+    │   ├── parquet_loader.py         #   Parquet 加载
+    │   ├── preprocessing.py          #   灰度化 + resize
+    │   ├── semantic_pairs.py         #   语义配对构建
+    │   ├── synthetic.py              #   合成数据生成（双月/瑞士卷等）
+    │   ├── synthetic_circle.py       #   合成圆环数据类
+    │   └── zero_padding.py           #   零填充（核心维度控制）
+    │
+    ├── logging/                      # 日志与可视化
+    │   ├── experiment_logger.py      #   WandB/TensorBoard 抽象层
+    │   └── plot_utils.py             #   绘图工具
+    │
+    ├── metrics/                      # 评估指标
+    │   ├── cosine_field.py           #   余弦相似度场（3种）
+    │   ├── evaluator.py              #   统一评估门面
+    │   ├── fid_evaluator.py          #   FID + 轨迹FID
+    │   ├── lpips_ssim.py             #   LPIPS + SSIM
+    │   ├── memory_ratio.py           #   动态记忆比例 f_mem(t)
+    │   ├── nn_search.py              #   Faiss 最近邻
+    │   └── reconstruction_gap.py     #   重建误差差距
+    │
+    ├── models/                       # 模型定义
+    │   ├── mlp.py                    #   MLP 模型
+    │   ├── score_network.py          #   得分网络封装
+    │   └── unet.py                   #   自适应维度 UNet
+    │
+    ├── sampling/                     # 采样引擎
+    │   ├── reverse_sampler.py        #   DDIM/Euler/Heun 采样器
+    │   └── trajectory_store.py       #   轨迹存储
+    │
+    ├── schedulers/                   # 噪声调度器
+    │   ├── base_scheduler.py         #   抽象基类
+    │   ├── of_scheduler.py           #   OF (Optimal Flow)
+    │   ├── ve_scheduler.py           #   VE (Variance Exploding)
+    │   └── vp_scheduler.py           #   VP (Variance Preserving)
+    │
+    ├── training/                     # 训练引擎
+    │   ├── checkpoint_manager.py     #   Checkpoint 管理
+    │   ├── phase_detector.py         #   M_gen/M_mem 自动检测
+    │   └── trainer.py                #   核心训练循环
+    │
+    └── utils/                        # 工具模块
+        ├── config.py                 #   配置加载与验证
+        ├── device.py                 #   GPU/CPU 设备管理
+        ├── math_ops.py               #   批量数学运算
+        └── seed.py                   #   随机种子管理
+```
 
-def main():
-    # 1. 初始化
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/experiment.yaml")
-    args = parser.parse_args()
-    
-    cfg = load_config(args.config)
-    set_seed(cfg.training.seed)
-    
-    exp_dir = get_experiment_dir(cfg)
-    os.makedirs(exp_dir, exist_ok=True)
-    
-    logger = setup_logger("DiffusionGeometryLab", os.path.join(exp_dir, "exp.log"))
-    logger.info(f"Experiment started. Save dir: {exp_dir}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+## 快速开始
 
-    # 2. 执行阶段
-    # 如果没有现成的 Checkpoint，则先训练
-    # _, scheduler = run_training_phase(cfg, device, logger)
-    
-    # 直接进行训练，训练完成后会自动保存 Checkpoint
-    run_training_phase(cfg, device, logger, exp_dir)
-    
-    # 3. 分析阶段
-    scheduler = get_scheduler(cfg) # 重新实例化 scheduler
-    run_analysis_phase(cfg, device, logger, exp_dir, scheduler)
-    
-    logger.info("Experiment finished.")
+### 1. 环境安装
 
-if __name__ == "__main__":
-    main()
+```bash
+# 克隆项目
+cd /your/project/path
+
+# 安装依赖
+pip install torch torchvision omegaconf matplotlib numpy faiss-cpu
+
+# 可选依赖（完整功能）
+pip install wandb tensorboard torchmetrics lpips h5py pandas pyarrow
+
+# 安装项目（开发模式）
+pip install -e .
+```
+
+### 2. 合成数据快速测试（推荐首次运行）
+
+```bash
+# 用圆环数据走通完整管线（~3-5分钟）
+python scripts/toy_full_pipeline.py
+
+# 查看结果
+ls outputs/toy_circle_test/
+# → 01_synthetic_data.png  02_trajectory.png  03_reconstruction_gap.png
+#   04_cosine_fields.png   05_memory_ratio.png  06_dimension_comparison.png
+#   report.txt  checkpoints/
+```
+
+### 3. 2D 圆环可视化 Demo
+
+```bash
+# 纯 2D 扩散过程可视化（无需 UNet）
+python scripts/toy_circle_demo.py
+
+ls outputs/toy_circle_demo/
+# → forward_process.png  score_field.png  reverse_process.png
+#   generation_quality.png  dimension_experiment.png
+```
+
+### 4. CelebA 正式训练
+
+```bash
+# 默认配置（d=4096）
+python scripts/train.py --config configs/default.yaml
+
+# 自定义维度
+python scripts/train.py --config configs/default.yaml \
+    --overrides data.target_dim=16384 data.target_resolution=128
+
+# 多维度批量实验
+python scripts/sweep_dimensions.py --dimensions 4096 16384
+
+# 评估（需要训练完成后的 checkpoint）
+python scripts/evaluate.py \
+    --config configs/default.yaml \
+    --ckpt_dir outputs/phase_transition_d4096/.../checkpoints
+```
+
+## 核心指标说明
+
+### A. 余弦相似度场 (Cosine Similarity Field)
+
+| 指标 | 定义 | 物理意义 |
+|------|------|---------|
+| $S_{cos}(M_{gen}, M_{mem})$ | 同一 $x_t$ 在两个模型下输出的余弦相似度 | 泛化与记忆模型的决策差异 |
+| $S_{cos}(\hat{s}_\theta, M_{emp})$ | 模型预测 vs 指向训练样本的理想方向 | 过拟合程度 |
+| $S_{cos}(\text{Train}, \text{Test})$ | 语义相似对注入相同噪声后的输出对齐度 | 局部曲率崩溃检测 |
+
+### B. 距离统计
+
+| 指标 | 定义 |
+|------|------|
+| 轨迹 FID | 反向采样中间态 $x_t$ 与真实分布的 FID |
+| $f_{mem}(t)$ | $R_t = \|x_t - a^{\mu_1}_t\| / \|x_t - a^{\mu_2}_t\| < 1/3$ 的样本比例 |
+| 重建差距 | $(MSE_{test} - MSE_{train}) / MSE_{train}$ |
+
+## 配置系统
+
+基于 OmegaConf 的分层配置：
+
+```bash
+# 基础配置 + 维度覆盖 + CLI 覆盖
+# 优先级: CLI > overlay > default
+
+python scripts/train.py \
+    --config configs/default.yaml \
+    --overrides
+    ```markdown
+    --overrides \
+    data.target_dim=16384 \
+    scheduler.type=ve \
+    training.max_steps=100000 \
+    training.batch_size=32
+```
+
+### 关键配置项
+
+| 配置路径 | 说明 | 默认值 |
+|---------|------|--------|
+| `data.grayscale_size` | 灰度图边长（决定 $m$） | 32 |
+| `data.target_dim` | 环境维度 $d$（必须是完全平方数） | 4096 |
+| `scheduler.type` | 噪声调度：`vp` / `ve` / `of` | vp |
+| `model.output_type` | 输出模式：`noise` / `score` / `velocity` | noise |
+| `training.max_steps` | 最大训练步数 | 500000 |
+| `training.phase_detection.enabled` | 是否启用相变自动检测 | true |
+
+## 噪声调度器
+
+| 调度器 | 数学定义 | 推荐搭配 |
+|--------|---------|---------|
+| **VP** | $x_t = \sqrt{\bar\alpha_t} x_0 + \sqrt{1-\bar\alpha_t}\epsilon$ | `output_type=noise` |
+| **VE** | $x_t = x_0 + \sigma(t)\epsilon$ | `output_type=score` |
+| **OF** | $x_t = (1-t)x_0 + t\epsilon$ | `output_type=velocity` |
+
+## 相变自动检测
+
+训练过程中自动监控并保存两个关键 checkpoint：
+
+### $M_{gen}$（泛化状态）
+- **触发条件**: FID 达到全局最低后连续 `fid_patience` 次未改善
+- **保存文件**: `checkpoints/model_gen.pt`
+- **物理意义**: 学会了流形结构，能生成新颖样本
+
+### $M_{mem}$（记忆状态）
+- **触发条件**: 满足以下任一：
+  - 重建误差差距 > `recon_gap_threshold`（默认 0.3）
+  - LPIPS < `lpips_threshold`（默认 0.05）
+  - 且训练步数 > `mem_step_multiplier` × $\tau_{gen}$
+- **保存文件**: `checkpoints/model_mem.pt`
+- **物理意义**: 背诵了训练集，发生模式坍塌
+
+## 实验设计
+
+### 核心实验：维度比率 $d/m$ 对相变的影响
+
+```
+固定 m = 1024（32×32 灰度图）
+
+d = 4096  (64×64)   → d/m = 4
+d = 16384 (128×128)  → d/m = 16
+d = 65536 (256×256)  → d/m = 64
+
+观察：
+1. τ_gen 和 τ_mem 如何随 d/m 变化？
+2. 余弦场曲线的形状变化？
+3. f_mem(t) 的崩溃点如何移动？
+```
+
+### 合成数据实验（验证理论）
+
+使用圆环等低维流形嵌入高维空间，在可控环境下验证：
+
+```bash
+# 修改 configs/toy_test.yaml 中的参数
+python scripts/toy_full_pipeline.py
+```
+
+支持的合成数据类型（`configs/toy_test.yaml` 中设置）：
+- `circle`: 单位圆（$m=1$）
+- `swiss_roll`: Swiss Roll（$m=2$）
+- `two_moons`: 双月形（$m=1$）
+
+## 输出文件说明
+
+### 合成数据测试输出
+
+```
+outputs/toy_circle_test/
+├── 01_synthetic_data.png        # 原始数据 + 编码后图像
+├── 02_trajectory.png            # 反向采样轨迹
+├── 03_reconstruction_gap.png    # 训练/测试重建差距
+├── 04_cosine_fields.png         # 余弦相似度场
+├── 05_memory_ratio.png          # 动态记忆比例
+├── 06_dimension_comparison.png  # 多维度 FID 对比
+├── report.txt                   # 文本摘要报告
+├── raw_points.pt                # 原始 2D 点数据
+└── checkpoints/
+    ├── latest.pt                # 最新 checkpoint
+    └── final.pt                 # 最终 checkpoint
+```
+
+### 正式训练输出
+
+```
+outputs/phase_transition_d4096/
+├── checkpoints/
+│   ├── model_gen.pt             # ★ 泛化状态 checkpoint
+│   ├── model_mem.pt             # ★ 记忆状态 checkpoint
+│   ├── latest.pt
+│   └── step_*.pt
+├── evaluation/
+│   ├── cosine_fields.png        # 三种余弦场对比
+│   ├── cosine_train_test.png    # Train-Test 余弦场
+│   └── recon_gap_*.png          # Gen/Mem 重建差距
+├── tb_logs/                     # TensorBoard 日志
+└── experiment.log               # 训练日志
+```
