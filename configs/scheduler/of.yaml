@@ -1,0 +1,4 @@
+scheduler:
+  type: "of"
+  of:
+    sigma_min: 0.001

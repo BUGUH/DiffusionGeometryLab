@@ -1,0 +1,118 @@
+# 圆环合成数据实验配置
+experiment:
+  name: "circle_D${data.ambient_dim}"
+  seed: 42
+  output_dir: "outputs/circle_D${data.ambient_dim}"
+  resume_from: null
+
+data:
+  parquet_path: "__circle__"          # 特殊标记：圆环数据
+  grayscale_size: 1                   # 无意义，占位
+  target_dim: 100                     # 占位，实际由 ambient_dim 控制
+  target_resolution: 10               # 占位
+  padding_mode: "center"
+  normalize_range: [-1.0, 1.0]
+  train_ratio: 0.8
+  num_workers: 0
+  pin_memory: false
+  # ---- Circle 专用参数 ----
+  circle:
+    num_samples: 5000
+    ambient_dim: 100                  # 背景空间维度 D
+    radius: 1.0
+    noise_std: 0.01
+    intrinsic_dim: 1                  # 圆环内蕴维度 m=1
+  ambient_dim: 100                    # 顶层引用，方便插值
+
+model:
+  arch: "mlp"                         # mlp | unet
+  in_channels: 1
+  out_channels: 1
+  base_channels: 32
+  channel_multipliers: [1, 2, 4]
+  num_res_blocks: 1
+  attention_resolutions: [4]
+  dropout: 0.1
+  time_embed_dim: 128
+  output_type: "noise"
+  # ---- MLP 专用 ----
+  mlp:
+    hidden_dims: [512, 512, 512]
+    activation: "silu"
+
+scheduler:
+  type: "vp"
+  num_diffusion_steps: 500
+  vp:
+    beta_schedule: "linear"
+    beta_start: 0.0001
+    beta_end: 0.02
+  ve:
+    sigma_min: 0.01
+    sigma_max: 50.0
+  of:
+    sigma_min: 0.001
+
+training:
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_steps: 20000
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  use_ema: true
+  eval_every_steps: 2000
+  log_every_steps: 500
+  save_every_steps: 5000
+  phase_detection:
+    enabled: true
+    fid_patience: 3
+    fid_window_size: 5
+    recon_gap_threshold: 0.2
+    lpips_threshold: 0.1
+    mem_step_multiplier: 2.5
+
+sampling:
+  method: "ddim"
+  num_sampling_steps: 100
+  trajectory_capture_timesteps: [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+  num_samples: 1024
+  store_trajectories: true
+  trajectory_backend: "memory"
+
+metrics:
+  cosine_field:
+    num_timesteps: 30
+    batch_size: 512
+    t_min: 0.01
+    t_max: 0.99
+  fid:
+    feature_dim: 2048
+    num_real_samples: 2000
+    num_fake_samples: 1024
+  memory_ratio:
+    threshold: 0.333
+    num_timesteps: 30
+    faiss_nprobe: 16
+    k_neighbors: 2
+  reconstruction_gap:
+    num_samples: 1000
+    timesteps: [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9]
+  lpips_ssim:
+    num_samples: 500
+
+logging:
+  backend: "none"
+  wandb:
+    project: "DiffusionGeometryLab"
+    entity: null
+    tags: ["circle"]
+  tensorboard:
+    log_dir: "${experiment.output_dir}/tb_logs"
+  log_images_every: 5000
+  num_log_images: 0
+
+device:
+  accelerator: "auto"
+  gpu_ids: [0]
+  mixed_precision: "none"

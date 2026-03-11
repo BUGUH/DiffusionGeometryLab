@@ -1,0 +1,7 @@
+# d = 4096 = 64×64
+data:
+  target_dim: 4096
+  target_resolution: 64
+
+experiment:
+  name: "phase_transition_d4096"

@@ -1,0 +1,113 @@
+# 合成数据（圆环）端到端测试配置
+# 所有参数最小化，快速验证管线
+
+experiment:
+  name: "toy_circle_test"
+  seed: 42
+  output_dir: "outputs/toy_circle_test"
+  resume_from: null
+
+data:
+  parquet_path: "__synthetic__"     # 特殊标记：使用合成数据
+  image_column: "image"
+  grayscale_size: 8                  # 8×8 = m=64
+  target_dim: 256                    # 16×16 = d=256, d/m=4
+  target_resolution: 16
+  padding_mode: "center"
+  normalize_range: [-1.0, 1.0]
+  train_ratio: 0.9
+  num_workers: 0                     # 合成数据用 0 避免问题
+  pin_memory: false
+  # 合成数据专用参数
+  synthetic:
+    type: "circle"
+    num_samples: 2000
+    noise_std: 0.05
+
+model:
+  in_channels: 1
+  out_channels: 1
+  base_channels: 32
+  channel_multipliers: [1, 2, 4]
+  num_res_blocks: 1
+  attention_resolutions: [4]
+  dropout: 0.0
+  time_embed_dim: 128
+  output_type: "noise"
+
+scheduler:
+  type: "vp"
+  num_diffusion_steps: 200
+  vp:
+    beta_schedule: "linear"
+    beta_start: 0.0001
+    beta_end: 0.02
+  ve:
+    sigma_min: 0.01
+    sigma_max: 50.0
+  of:
+    sigma_min: 0.001
+
+training:
+  batch_size: 64
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  max_steps: 3000                    # 快速测试
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  use_ema: true
+  eval_every_steps: 500
+  log_every_steps: 100
+  save_every_steps: 1000
+  phase_detection:
+    enabled: true
+    fid_patience: 2
+    fid_window_size: 3
+    recon_gap_threshold: 0.2
+    lpips_threshold: 0.1
+    mem_step_multiplier: 2.0
+
+sampling:
+  method: "ddim"
+  num_sampling_steps: 50
+  trajectory_capture_timesteps: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+  num_samples: 256
+  store_trajectories: true
+  trajectory_backend: "memory"
+
+metrics:
+  cosine_field:
+    num_timesteps: 20
+    batch_size: 128
+    t_min: 0.01
+    t_max: 0.99
+  fid:
+    feature_dim: 2048
+    num_real_samples: 500
+    num_fake_samples: 256
+  memory_ratio:
+    threshold: 0.333
+    num_timesteps: 20
+    faiss_nprobe: 8
+    k_neighbors: 2
+  reconstruction_gap:
+    num_samples: 200
+    timesteps: [0.1, 0.3, 0.5, 0.7, 0.9]
+  lpips_ssim:
+    num_samples: 100
+
+logging:
+  backend: "none"
+  wandb:
+    project: "test"
+    entity: null
+    tags: ["toy_test"]
+  tensorboard:
+    log_dir: "outputs/toy_circle_test/tb_logs"
+  log_images_every: 1000
+  num_log_images: 4
+
+device:
+  accelerator: "auto"
+  gpu_ids: [0]
+  mixed_precision: "none"

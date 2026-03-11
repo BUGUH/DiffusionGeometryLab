@@ -1,0 +1,11 @@
+# d = 16384 = 128×128
+data:
+  target_dim: 16384
+  target_resolution: 128
+
+experiment:
+  name: "phase_transition_d16384"
+
+model:
+  # 更高维度可能需要更深的 UNet
+  channel_multipliers: [1, 2, 4, 8, 8]

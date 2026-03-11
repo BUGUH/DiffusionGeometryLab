@@ -1,0 +1,129 @@
+# ============================================================
+# DiffusionGeometryLab — 全局默认配置
+# ============================================================
+
+# ---- 实验元信息 ----
+experiment:
+  name: "phase_transition_d${data.target_dim}"
+  seed: 42
+  output_dir: "outputs/${experiment.name}/${now:%Y-%m-%d_%H-%M-%S}"
+  resume_from: null  # checkpoint 路径，null 表示从头训练
+
+# ---- 数据管线 ----
+data:
+  parquet_path: "diffusion/CelebA/0000.parquet"
+  image_column: "image"                # parquet 中图像列名
+  grayscale_size: 32                   # 灰度图边长 → m = 32*32 = 1024
+  target_dim: 4096                     # 环境维度 d（必须是完全平方数）
+  target_resolution: 64                # = sqrt(target_dim)，自动计算备用
+  padding_mode: "center"               # center | top_left
+  normalize_range: [-1.0, 1.0]
+  train_ratio: 0.9
+  num_workers: 4
+  pin_memory: true
+
+# ---- 模型 ----
+model:
+  # UNet 超参
+  in_channels: 1
+  out_channels: 1
+  base_channels: 64
+  channel_multipliers: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]       # 在这些空间分辨率处插入注意力
+  dropout: 0.1
+  time_embed_dim: 256
+  # 得分网络输出模式
+  output_type: "noise"                 # noise | score | velocity
+
+# ---- 噪声调度 ----
+scheduler:
+  type: "vp"                           # vp | ve | of
+  num_diffusion_steps: 1000
+  # VP 专用
+  vp:
+    beta_schedule: "linear"            # linear | cosine
+    beta_start: 0.0001
+    beta_end: 0.02
+  # VE 专用
+  ve:
+    sigma_min: 0.01
+    sigma_max: 50.0
+  # OF 专用
+  of:
+    sigma_min: 0.001
+
+# ---- 训练 ----
+training:
+  batch_size: 64
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  max_steps: 500000
+  grad_clip_norm: 1.0
+  ema_decay: 0.9999
+  use_ema: true
+
+  # 评估与检测频率
+  eval_every_steps: 5000
+  log_every_steps: 100
+  save_every_steps: 10000
+
+  # 相变检测
+  phase_detection:
+    enabled: true
+    # M_gen 检测
+    fid_patience: 3                    # FID 连续 N 次不降则锁定 gen checkpoint
+    fid_window_size: 5                 # FID 滑动窗口大小
+    # M_mem 检测
+    recon_gap_threshold: 0.3           # |MSE_test - MSE_train| / MSE_train > 阈值
+    lpips_threshold: 0.05              # 生成样本与训练集最近邻 LPIPS < 阈值视为记忆
+    mem_step_multiplier: 3.0           # τ_mem > multiplier * τ_gen
+
+# ---- 采样 ----
+sampling:
+  method: "ddim"                       # euler_maruyama | ddim | heun
+  num_sampling_steps: 100
+  trajectory_capture_timesteps: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+  num_samples: 1024                    # 每次评估生成样本数
+  store_trajectories: true
+  trajectory_backend: "hdf5"           # hdf5 | memory
+
+# ---- 评估指标 ----
+metrics:
+  cosine_field:
+    num_timesteps: 50                  # t 轴采样点数
+    batch_size: 256
+    t_min: 0.001
+    t_max: 0.999
+  fid:
+    feature_dim: 2048                  # Inception 特征维度
+    num_real_samples: 5000
+    num_fake_samples: 5000
+  memory_ratio:
+    threshold: 0.333                   # R_t < 1/3 判定为记忆
+    num_timesteps: 50
+    faiss_nprobe: 32
+    k_neighbors: 2                     # 最近邻 + 次近邻
+  reconstruction_gap:
+    num_samples: 1000
+    timesteps: [0.1, 0.3, 0.5, 0.7, 0.9]
+  lpips_ssim:
+    num_samples: 500
+
+# ---- 日志 ----
+logging:
+  backend: "wandb"                     # wandb | tensorboard | both | none
+  wandb:
+    project: "DiffusionGeometryLab"
+    entity: null                       # 填你的 wandb 用户名/团队
+    tags: ["phase_transition", "d=${data.target_dim}"]
+  tensorboard:
+    log_dir: "${experiment.output_dir}/tb_logs"
+  log_images_every: 10000
+  num_log_images: 16
+
+# ---- 硬件 ----
+device:
+  accelerator: "auto"                  # auto | cuda | cpu | mps
+  gpu_ids: [0]
+  mixed_precision: "fp16"              # fp16 | bf16 | none
