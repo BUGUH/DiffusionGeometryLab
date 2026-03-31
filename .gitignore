@@ -64,4 +64,13 @@ runs/
 *.log
 
 # WandB (重要！)
-wandb/
+wandb/LightCNN_29Layers_V2_checkpoint.pth.tar
+checkpoints/
+results/
+data/
+LightCNN_29Layers_V2_checkpoint.pth.tar
+checkpoints/
+results/
+data/
+*.pth
+*.tar
